@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import random
 import sqlite3
 import sys
 import threading
@@ -50,6 +51,8 @@ from imagery_tile_selection import (
 
 PNG_MAGIC = b"\x89PNG"
 STATUSES = ("downloaded", "existing", "missing", "failed")
+# Set while a failed attempt will be retried, so its ERROR line goes to the log file only.
+_attempt = threading.local()
 
 
 def parse_zoom_range(text: str) -> List[int]:
@@ -147,6 +150,7 @@ class Job:
         self.plan_counts: Dict[int, int] = {}
         self.done_counts: Dict[int, int] = {z: 0 for z in args.zoom}
         self.counts = {s: 0 for s in STATUSES}
+        self.retries = 0
         self.bytes = 0
         self.start = 0.0
         self.end = 0.0
@@ -204,11 +208,22 @@ def tile_path(out_dir: Path, z: int, x: int, y: int, ext: str) -> Path:
     return out_dir / str(z) / str(x) / f"{y}.{ext}"
 
 
-def fetch(out_dir: Path, z: int, x: int, y: int) -> Tuple[int, str, int]:
-    if tile_path(out_dir, z, x, y, "png").exists():
+def fetch(job: Job, z: int, x: int, y: int) -> Tuple[int, str, int]:
+    if tile_path(job.out_dir, z, x, y, "png").exists():
         return z, "existing", 0
-    jpg = tile_path(out_dir, z, x, y, "jpg")
-    status, nbytes = dl.fetch_tile(z, x, y, jpg, state_label="")
+    jpg = tile_path(job.out_dir, z, x, y, "jpg")
+    retries = max(0, job.args.retries)
+    for attempt in range(retries + 1):
+        # Servers (USGS especially) throw transient 502/503s under load; back off and try again.
+        _attempt.retrying = attempt < retries and not job.stop.is_set()
+        status, nbytes = dl.fetch_tile(z, x, y, jpg, state_label="")
+        if status != "failed" or not _attempt.retrying:
+            break
+        with job.lock:
+            job.retries += 1
+        if job.stop.wait(min(30.0, 2.0 ** attempt) * random.uniform(0.75, 1.25)):
+            break
+    _attempt.retrying = False
     # Viewers pick the decoder from the extension; keep PNG payloads named .png.
     if status == "downloaded":
         with open(jpg, "rb") as f:
@@ -229,7 +244,7 @@ def download(job: Job, plan: List[Tuple[int, int, int]]) -> None:
                 tile = next(todo, None)
                 if tile is None:
                     break
-                pending.add(pool.submit(fetch, job.out_dir, *tile))
+                pending.add(pool.submit(fetch, job, *tile))
             if not pending:
                 break
             finished, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -307,7 +322,7 @@ def run_plain(job: Job) -> None:
             c = job.counts
             msg = (
                 f"{job.done:,}/{job.total:,}  new {c['downloaded']:,}  skip {c['existing']:,}  "
-                f"404 {c['missing']:,}  fail {c['failed']:,}  {rate:.0f}/s  "
+                f"404 {c['missing']:,}  fail {c['failed']:,}  retry {job.retries:,}  {rate:.0f}/s  "
                 f"eta {human_duration(eta) if eta is not None else '?'}"
             )
             if msg != last:
@@ -369,6 +384,7 @@ class Dashboard:
             done = dict(job.done_counts)
             counts = dict(job.counts)
             nbytes = job.bytes
+            retries = job.retries
             recent = list(job.recent)
         elapsed, rate, eta = rate_and_eta(job)
         total, finished = sum(plan.values()), sum(counts.values())
@@ -426,6 +442,8 @@ class Dashboard:
             text = f"{counts[key]:,} {label}"
             self.put(y, x, text, self.attr(attr) if counts[key] else 0)
             x += len(text) + 4
+        if retries:
+            self.put(y, x, f"{retries:,} retried", self.attr("warn"))
         y += 1
         avg = nbytes / counts["downloaded"] if counts["downloaded"] else 0
         remaining = total - finished
@@ -492,9 +510,12 @@ def print_summary(job: Job) -> None:
         print(
             f"{'Stopped' if job.stop.is_set() else 'Done'} in {human_duration(elapsed)}: "
             f"{c['downloaded']:,} downloaded ({human_bytes(job.bytes)}), {c['existing']:,} already present, "
-            f"{c['missing']:,} not available (404), {c['failed']:,} failed",
+            f"{c['missing']:,} not available (404), {c['failed']:,} failed "
+            f"({job.retries:,} retried attempt(s))",
             file=out,
         )
+        if c["failed"]:
+            print("Re-run the same command to fetch the failed tiles; everything else is skipped.", file=out)
         if job.args.check_kb > 0 and job.phase == "done":
             for warning in job.warnings:
                 print(f"WARNING: {warning}", file=out)
@@ -521,6 +542,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="zoom levels, e.g. 3-16 (default) or 14")
     ap.add_argument("-o", "--out", type=Path, required=True, help="output directory (gets z/x/y.jpg)")
     ap.add_argument("--workers", type=int, default=dl.MAX_DOWNLOAD_WORKERS, help="parallel downloads")
+    ap.add_argument("--retries", type=int, default=4,
+                    help="retries per tile on errors such as 502/503, with backoff (default 4)")
     ap.add_argument("--dry-run", action="store_true", help="only count tiles")
     ap.add_argument("--plain", action="store_true", help="plain progress lines instead of the dashboard")
     ap.add_argument("--check-kb", type=int, default=96, metavar="KB",
@@ -546,7 +569,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     job = Job(args, areas, args.out.expanduser().resolve())
     # The shared downloader logs to stdout; route it into the job so it can't scribble over the dashboard.
-    dl.log = lambda msg: (dl.LOGGER._fh.write(f"{msg}\n"), job.note(msg))
+    def log(msg: str) -> None:
+        dl.LOGGER._fh.write(f"{msg}\n")
+        if not getattr(_attempt, "retrying", False):
+            job.note(msg)
+
+    dl.log = log
 
     worker = threading.Thread(target=work, args=(job,), daemon=True)
     worker.start()
