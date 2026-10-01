@@ -51,6 +51,22 @@ The root script runs **`scripts/install_linux.sh`**, which:
 
 After a successful run, use those desktop entries or the two shell scripts above. You only need to run **`install_linux.sh`** again if you move the tree, recreate the venv, or need to refresh system/Python dependencies.
 
+## Command-line tile download (no phone, no GUI)
+
+`scripts/xyz_tile_download.py` downloads the same imagery (USGS below z16, Google Hybrid z16–20) into a plain `{z}/{x}/{y}.jpg` tree. You don't need a phone, USB debugging, or a desktop session. Any offline slippy-map viewer can read the output. For example, copy it to `/tiles` on a Squatch Mesh SD card. In a terminal it shows a live dashboard (press `q` to stop). Use `--plain` for plain log lines.
+
+```bash
+PY=.venv/bin/python   # venv created by install_linux.sh
+# 10-mile radius, zooms 3-16
+$PY scripts/xyz_tile_download.py --center 47.66 -117.42 --radius 10 --zoom 3-16 -o ~/tiles
+# Same area as an existing ATAK imagery package
+$PY scripts/xyz_tile_download.py --like ATAK_SQL_Sandpoint.sqlite --zoom 3-16 -o ~/tiles
+# Whole states, or a bbox (west south east north); --dry-run only counts tiles
+$PY scripts/xyz_tile_download.py --state Idaho --bbox -117.6 47.5 -117.2 47.8 --zoom 3-13 -o ~/tiles --dry-run
+```
+
+You can combine areas, and re-runs skip tiles already on disk. After a download, the script warns about tiles over 96 KB and about progressive JPEGs, because small firmware decoders can't use either (`--check-kb 0` skips this check).
+
 ---
 
 ## Current stable release (Linux / source)
